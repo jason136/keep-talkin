@@ -5,15 +5,10 @@ use std::{
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use pcre2::bytes::{Regex, RegexBuilder};
 use priority_queue::PriorityQueue;
 use rayon::prelude::*;
 use thiserror::Error;
-
-#[cfg(feature = "pcre2")]
-use pcre2::bytes::{Regex, RegexBuilder};
-
-#[cfg(not(feature = "pcre2"))]
-use regex::bytes::Regex;
 
 pub mod loader;
 
@@ -22,6 +17,7 @@ pub type Rank = u32;
 type EncoderMap = HashMap<Word, Rank, NoOpHasher>;
 type DecoderMap = HashMap<Rank, Vec<u8>, NoOpHasher>;
 
+#[derive(Debug)]
 pub struct Token {
     pub bytes: Vec<u8>,
     pub rank: Rank,
@@ -29,6 +25,7 @@ pub struct Token {
 
 pub struct Tokenizer {
     encoder: EncoderMap,
+    merge_priorities: Option<HashMap<(Word, Word), Rank>>,
     special_encoder: EncoderMap,
     decoder: DecoderMap,
     special_tokens_decoder: DecoderMap,
@@ -39,6 +36,7 @@ impl Tokenizer {
     fn from_vocab_and_regex(
         vocab: Vec<Token>,
         special_vocab: Vec<Token>,
+        merge_priorities: Option<HashMap<(Word, Word), Rank>>,
         regex_pattern: &str,
     ) -> Result<Self, Error> {
         let special_tokens_matcher = AhoCorasickBuilder::new()
@@ -50,35 +48,25 @@ impl Tokenizer {
                     .collect::<Vec<_>>(),
             )?;
 
-        #[cfg(feature = "pcre2")]
-        let regex = {
-            let mut builder = RegexBuilder::new();
-            #[cfg(feature = "jit-regex")]
-            {
-                // builder.jit_if_available(true);
-                // builder.max_jit_stack_size(Some(1024 * 1024));
-            }
-
-            // builder.utf(true);
-            // builder.ucp(true);
-
-            builder.build(regex_pattern)?
-        };
-
-        #[cfg(not(feature = "pcre2"))]
-        let regex = Regex::new(regex_pattern)?;
+        let regex = RegexBuilder::new()
+            .jit_if_available(true)
+            .max_jit_stack_size(Some(1024 * 1024))
+            .utf(true)
+            .ucp(true)
+            .build(regex_pattern)?;
 
         let splitters = vec![
             Splitter::AhoCorasick(special_tokens_matcher),
             Splitter::Regex(regex),
         ];
 
-        Self::from_vocab_and_splitters(vocab, special_vocab, splitters)
+        Self::from_vocab_and_splitters(vocab, special_vocab, merge_priorities, splitters)
     }
 
     fn from_vocab_and_splitters(
         vocab: Vec<Token>,
         special_vocab: Vec<Token>,
+        merge_priorities: Option<HashMap<(Word, Word), Rank>>,
         splitters: Vec<Splitter>,
     ) -> Result<Self, Error> {
         let mut encoder = EncoderMap::default();
@@ -99,6 +87,7 @@ impl Tokenizer {
 
         Ok(Self {
             encoder,
+            merge_priorities,
             special_encoder,
             decoder,
             special_tokens_decoder,
@@ -131,31 +120,26 @@ impl Tokenizer {
         text: &[u8],
         _allowed_special: &HashSet<String>,
     ) -> Result<Vec<Rank>, Error> {
-        let splits =
-            self.splitters
-                .iter()
-                .try_fold(vec![Split::Unfinished(text)], |splits, splitter| {
-                    splits
-                        .into_par_iter()
-                        .map(|split| match split {
-                            Split::Unfinished(s) => splitter.split(s),
-                            finished => Ok(vec![finished]),
+        self.splitters
+            .iter()
+            .try_fold(vec![Split::Unfinished(text)], |splits, splitter| {
+                splits
+                    .into_par_iter()
+                    .map(|split| match split {
+                        Split::Unfinished(s) => splitter.split(s),
+                        finished => Ok(vec![finished]),
+                    })
+                    .try_fold(Vec::new, |mut acc, result_splits| {
+                        result_splits.map(|splits| {
+                            acc.extend(splits);
+                            acc
                         })
-                        .try_fold(Vec::new, |mut acc, result_splits| {
-                            result_splits.map(|splits| {
-                                acc.extend(splits);
-                                acc
-                            })
-                        })
-                        .try_reduce(Vec::new, |mut a, b| {
-                            a.extend(b);
-                            Ok(a)
-                        })
-                })?;
-
-        println!("splits: {:?}", splits);
-
-        splits
+                    })
+                    .try_reduce(Vec::new, |mut a, b| {
+                        a.extend(b);
+                        Ok(a)
+                    })
+            })?
             .into_par_iter()
             .map(|split| match split {
                 Split::Finished(s) => {
@@ -167,7 +151,13 @@ impl Tokenizer {
                         Err(Error::NoValidToken(String::from_utf8_lossy(s).to_string()))
                     }
                 }
-                Split::Unfinished(s) => self.bpe_merge(s),
+                Split::Unfinished(s) => {
+                    if let Some(rank) = self.encoder.get(&Word::from_bytes(s)) {
+                        Ok(vec![*rank])
+                    } else {
+                        self.bpe_merge(s)
+                    }
+                }
             })
             .try_fold(Vec::new, |mut acc, result_ranks| {
                 result_ranks.map(|ranks| {
@@ -182,6 +172,7 @@ impl Tokenizer {
     }
 
     fn bpe_merge(&self, chunk: &[u8]) -> Result<Vec<Rank>, Error> {
+        #[derive(Debug, Clone)]
         struct WordState {
             word: Word,
             left_index: usize,
@@ -193,7 +184,7 @@ impl Tokenizer {
         let mut word_states = chunk
             .iter()
             .enumerate()
-            .map(|(left_index, byte)| {
+            .map(|(right_index, byte)| {
                 let word = Word::from_bytes(std::slice::from_ref(byte));
                 Ok(WordState {
                     rank: self
@@ -202,19 +193,20 @@ impl Tokenizer {
                         .copied()
                         .ok_or(Error::NoTokenForByte(*byte))?,
                     word,
-                    left_index,
-                    right_index: left_index + 1,
+                    left_index: right_index.wrapping_sub(1),
+                    right_index,
                     is_removed: false,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        #[derive(PartialEq, Eq)]
+        #[derive(PartialEq, Eq, Debug)]
         struct Match {
             left_index: usize,
             right_index: usize,
             combined: Word,
             rank: Option<Rank>,
+            priority: Option<Rank>,
         }
 
         impl PartialOrd for Match {
@@ -225,11 +217,14 @@ impl Tokenizer {
 
         impl Ord for Match {
             fn cmp(&self, other: &Self) -> Ordering {
-                match (self.rank, other.rank) {
-                    (Some(a), Some(b)) => b.cmp(&a),
-                    (Some(_), None) => Ordering::Less,
-                    (None, Some(_)) => Ordering::Greater,
-                    (None, None) => Ordering::Equal,
+                match (self.priority, other.priority, self.rank, other.rank) {
+                    (Some(a), Some(b), _, _) => b.cmp(&a),
+                    (Some(_), None, _, _) => Ordering::Greater,
+                    (None, Some(_), _, _) => Ordering::Less,
+                    (_, _, Some(a), Some(b)) => a.cmp(&b),
+                    (_, _, Some(_), None) => Ordering::Greater,
+                    (_, _, None, Some(_)) => Ordering::Less,
+                    (None, None, None, None) => Ordering::Equal,
                 }
             }
         }
@@ -242,6 +237,12 @@ impl Tokenizer {
                 |(left_index, (WordState { word: left, .. }, WordState { word: right, .. }))| {
                     let combined = Word::combine(left, right);
                     let rank = self.encoder.get(&combined).copied();
+                    let priority = self
+                        .merge_priorities
+                        .as_ref()
+                        .and_then(|m| m.get(&(left.clone(), right.clone())).copied());
+                    
+                    
 
                     (
                         left_index,
@@ -250,6 +251,7 @@ impl Tokenizer {
                             right_index: left_index + 1,
                             combined,
                             rank,
+                            priority,
                         },
                     )
                 },
@@ -264,23 +266,28 @@ impl Tokenizer {
                     right_index: consumed_word_index,
                     combined,
                     rank: Some(rank),
+                    ..
                 },
             )) = matches_queue.pop()
             else {
                 break;
             };
+            
 
             let consumed_word = word_states.get(consumed_word_index).unwrap();
             let new_word = word_states.get(new_word_index).unwrap();
 
-            let left_match_and_word = matches_queue
-                .get(&new_word.left_index)
-                .map(|(i, m)| (*i, m.left_index, word_states.get(m.left_index).unwrap()));
 
-            if let Some((left_match_index, left_match_left_index, left_word)) = left_match_and_word
+            if let Some((left_match_index, left_match_left_index, left_word)) = matches_queue
+                .get(&new_word.left_index)
+                .map(|(i, m)| (*i, m.left_index, word_states.get(m.left_index).unwrap()))
             {
                 let left_new_combined = Word::combine(&left_word.word, &combined);
                 let left_new_rank = self.encoder.get(&left_new_combined).copied();
+                let left_new_priority = self
+                    .merge_priorities
+                    .as_ref()
+                    .and_then(|m| m.get(&(left_word.word.clone(), combined.clone())).copied());
 
                 matches_queue.change_priority(
                     &left_match_index,
@@ -289,19 +296,21 @@ impl Tokenizer {
                         right_index: new_word_index,
                         combined: left_new_combined,
                         rank: left_new_rank,
+                        priority: left_new_priority,
                     },
                 );
             }
 
-            let right_match_and_word = matches_queue
+            if let Some((right_match_index, right_match_right_index, right_word)) = matches_queue
                 .get(&consumed_word.right_index)
-                .map(|(i, m)| (*i, m.right_index, word_states.get(m.right_index).unwrap()));
-
-            if let Some((right_match_index, right_match_right_index, right_word)) =
-                right_match_and_word
+                .map(|(i, m)| (*i, m.right_index, word_states.get(m.right_index).unwrap()))
             {
-                let right_new_combined = Word::combine(&right_word.word, &combined);
+                let right_new_combined = Word::combine(&combined.clone(), &right_word.word);
                 let right_new_rank = self.encoder.get(&right_new_combined).copied();
+                let right_new_priority = self
+                    .merge_priorities
+                    .as_ref()
+                    .and_then(|m| m.get(&(combined.clone(), right_word.word.clone())).copied());
 
                 matches_queue.change_priority(
                     &right_match_index,
@@ -310,6 +319,7 @@ impl Tokenizer {
                         right_index: right_match_right_index,
                         combined: right_new_combined,
                         rank: right_new_rank,
+                        priority: right_new_priority,
                     },
                 );
             }
@@ -365,33 +375,29 @@ impl Splitter {
                     chunks.push(Split::Unfinished(&text[start..]));
                 }
 
-                println!("ahocorasick chunks: {:?}", chunks);
+                Ok(chunks)
+            }
+            Splitter::Regex(regex) => {
+                let mut chunks = Vec::new();
+                let mut start = 0;
+                for m in regex.find_iter(text).collect::<Result<Vec<_>, _>>()? {
+                    if m.start() > start {
+                        chunks.push(Split::Unfinished(&text[start..m.start()]));
+                    }
+                    chunks.push(Split::Unfinished(&text[m.start()..m.end()]));
+                    start = m.end();
+                }
+                if start < text.len() {
+                    chunks.push(Split::Unfinished(&text[start..]));
+                }
 
                 Ok(chunks)
             }
-            Splitter::Regex(regex) => regex
-                .find_iter(text)
-                .map(|m| {
-                    println!("regex match: {:?}", m);
-
-                    #[cfg(feature = "pcre2")]
-                    {
-                        Ok(m.map(|m| Split::Unfinished(m.as_bytes()))?)
-                    }
-                    #[cfg(not(feature = "pcre2"))]
-                    {
-                        Ok(Split::Unfinished(m.as_bytes()))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(|chunks| {
-                    println!("regex chunks: {:?}", chunks);
-                    chunks
-                }),
         }
     }
 }
 
+#[derive(Debug, Clone)]
 struct Word {
     hash: u64,
     length: usize,
@@ -404,7 +410,7 @@ impl Word {
     pub fn from_bytes(seq: &[u8]) -> Self {
         let mut hash = 0u64;
         for &byte in seq {
-            hash = (hash.wrapping_mul(HASH_BASE) + byte as u64) % HASH_MOD;
+            hash = ((hash as u128 * HASH_BASE as u128 + byte as u128) % HASH_MOD as u128) as u64;
         }
         Self {
             hash,
@@ -413,11 +419,9 @@ impl Word {
     }
 
     pub fn combine(left: &Self, right: &Self) -> Self {
-        let combined_hash = (left
-            .hash
-            .wrapping_mul(pow_mod(HASH_BASE, right.length, HASH_MOD))
-            + right.hash)
-            % HASH_MOD;
+        let left_shifted = (left.hash as u128 * pow_mod(HASH_BASE, right.length, HASH_MOD) as u128)
+            % HASH_MOD as u128;
+        let combined_hash = ((left_shifted + right.hash as u128) % HASH_MOD as u128) as u64;
 
         Self {
             hash: combined_hash,
@@ -432,16 +436,16 @@ fn pow_mod(mut base: u64, mut exp: usize, modulus: u64) -> u64 {
 
     while exp > 0 {
         if exp & 1 == 1 {
-            result = (result.wrapping_mul(base)) % modulus;
+            result = ((result as u128 * base as u128) % modulus as u128) as u64;
         }
-        base = (base.wrapping_mul(base)) % modulus;
+        base = ((base as u128 * base as u128) % modulus as u128) as u64;
         exp >>= 1;
     }
 
     result
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct NoOpHasher {
     hash: u64,
 }
@@ -492,13 +496,8 @@ impl Hash for Word {
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[cfg(not(feature = "pcre2"))]
     #[error("regex compilation failed: {0}")]
-    RegexError(#[from] regex::Error),
-
-    #[cfg(feature = "pcre2")]
-    #[error("pcre2 regex compilation failed: {0}")]
-    Pcre2Error(#[from] pcre2::Error),
+    RegexError(#[from] pcre2::Error),
 
     #[error("aho-corasick build failed: {0}")]
     AhoCorasickError(#[from] aho_corasick::BuildError),
