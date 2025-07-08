@@ -25,7 +25,6 @@ pub struct Token {
 
 pub struct Tokenizer {
     encoder: EncoderMap,
-    merge_priorities: Option<HashMap<(Word, Word), Rank>>,
     special_encoder: EncoderMap,
     decoder: DecoderMap,
     special_tokens_decoder: DecoderMap,
@@ -36,7 +35,6 @@ impl Tokenizer {
     fn from_vocab_and_regex(
         vocab: Vec<Token>,
         special_vocab: Vec<Token>,
-        merge_priorities: Option<HashMap<(Word, Word), Rank>>,
         regex_patterns: Vec<impl AsRef<str>>,
     ) -> Result<Self, Error> {
         let special_tokens_matcher = AhoCorasickBuilder::new()
@@ -83,7 +81,6 @@ impl Tokenizer {
 
         Ok(Self {
             encoder,
-            merge_priorities,
             special_encoder,
             decoder,
             special_tokens_decoder,
@@ -201,7 +198,6 @@ impl Tokenizer {
             right_index: usize,
             combined: Word,
             rank: Option<Rank>,
-            priority: Option<Rank>,
         }
 
         impl PartialOrd for Match {
@@ -212,14 +208,11 @@ impl Tokenizer {
 
         impl Ord for Match {
             fn cmp(&self, other: &Self) -> Ordering {
-                match match (self.priority, other.priority, self.rank, other.rank) {
-                    (Some(a), Some(b), _, _) => b.cmp(&a),
-                    (Some(_), None, _, _) => Ordering::Greater,
-                    (None, Some(_), _, _) => Ordering::Less,
-                    (_, _, Some(a), Some(b)) => b.cmp(&a),
-                    (_, _, Some(_), None) => Ordering::Greater,
-                    (_, _, None, Some(_)) => Ordering::Less,
-                    (None, None, None, None) => Ordering::Equal,
+                match match (self.rank, other.rank) {
+                    (Some(a), Some(b)) => b.cmp(&a),
+                    (Some(_), None) => Ordering::Greater,
+                    (None, Some(_)) => Ordering::Less,
+                    (None, None) => Ordering::Equal,
                 } {
                     Ordering::Equal => other.left_index.cmp(&self.left_index),
                     o => o,
@@ -235,10 +228,6 @@ impl Tokenizer {
                 |(left_index, (WordState { word: left, .. }, WordState { word: right, .. }))| {
                     let combined = Word::combine(left, right);
                     let rank = self.encoder.get(&combined).copied();
-                    let priority = self
-                        .merge_priorities
-                        .as_ref()
-                        .and_then(|m| m.get(&(left.clone(), right.clone())).copied());
 
                     (
                         left_index,
@@ -247,7 +236,6 @@ impl Tokenizer {
                             right_index: left_index + 1,
                             combined,
                             rank,
-                            priority,
                         },
                     )
                 },
@@ -278,10 +266,6 @@ impl Tokenizer {
             {
                 let left_new_combined = Word::combine(&left_word.word, &combined);
                 let left_new_rank = self.encoder.get(&left_new_combined).copied();
-                let left_new_priority = self
-                    .merge_priorities
-                    .as_ref()
-                    .and_then(|m| m.get(&(left_word.word.clone(), combined.clone())).copied());
 
                 matches_queue.change_priority(
                     &left_match_index,
@@ -290,7 +274,6 @@ impl Tokenizer {
                         right_index: new_word_index,
                         combined: left_new_combined,
                         rank: left_new_rank,
-                        priority: left_new_priority,
                     },
                 );
             }
@@ -301,10 +284,6 @@ impl Tokenizer {
             {
                 let right_new_combined = Word::combine(&combined.clone(), &right_word.word);
                 let right_new_rank = self.encoder.get(&right_new_combined).copied();
-                let right_new_priority = self
-                    .merge_priorities
-                    .as_ref()
-                    .and_then(|m| m.get(&(combined.clone(), right_word.word.clone())).copied());
 
                 matches_queue.change_priority(
                     &right_match_index,
@@ -313,7 +292,6 @@ impl Tokenizer {
                         right_index: right_match_right_index,
                         combined: right_new_combined,
                         rank: right_new_rank,
-                        priority: right_new_priority,
                     },
                 );
             }
