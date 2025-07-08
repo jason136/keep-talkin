@@ -10,7 +10,7 @@ fn bench_build(c: &mut Criterion) {
     let tokenizer_configs = load_tokenizer_configs(None).unwrap();
 
     let mut build_group = c.benchmark_group("tokenizer_build");
-    build_group.measurement_time(std::time::Duration::from_secs(10));
+    build_group.sample_size(10);
     for (model_name, tokenizer_path) in &tokenizer_configs {
         build_group.bench_function(model_name, |b| {
             b.iter(|| black_box(Tokenizer::from_tokenizer_json(tokenizer_path).unwrap()))
@@ -29,7 +29,7 @@ fn bench_encode(c: &mut Criterion) {
         .collect();
 
     let mut encode_group = c.benchmark_group("encode");
-    encode_group.measurement_time(std::time::Duration::from_secs(10));
+    encode_group.sample_size(10);
     for (tokenizer, (model_name, _)) in tokenizers.iter().zip(&tokenizer_configs) {
         encode_group.bench_function(model_name, |b| {
             b.iter(|| {
@@ -56,7 +56,7 @@ fn bench_decode(c: &mut Criterion) {
         .collect();
 
     let mut decode_group = c.benchmark_group("decode");
-    decode_group.measurement_time(std::time::Duration::from_secs(10));
+    decode_group.sample_size(10);
     for (tokenizer, (model_name, _)) in tokenizers.iter().zip(&tokenizer_configs) {
         let encoded_corpus_texts = corpus_texts
             .iter()

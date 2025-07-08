@@ -37,7 +37,7 @@ impl Tokenizer {
         vocab: Vec<Token>,
         special_vocab: Vec<Token>,
         merge_priorities: Option<HashMap<(Word, Word), Rank>>,
-        regex_pattern: &str,
+        regex_patterns: Vec<impl AsRef<str>>,
     ) -> Result<Self, Error> {
         let special_tokens_matcher = AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostLongest)
@@ -48,27 +48,23 @@ impl Tokenizer {
                     .collect::<Vec<_>>(),
             )?;
 
-        let regex = RegexBuilder::new()
-            .jit_if_available(true)
-            .max_jit_stack_size(Some(1024 * 1024))
-            .utf(true)
-            .ucp(true)
-            .build(regex_pattern)?;
+        let regexes = regex_patterns
+            .iter()
+            .map(|pattern| {
+                Ok(Splitter::Regex(
+                    RegexBuilder::new()
+                        .jit_if_available(true)
+                        .max_jit_stack_size(Some(1024 * 1024))
+                        .utf(true)
+                        .ucp(true)
+                        .build(pattern.as_ref())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
 
-        let splitters = vec![
-            Splitter::AhoCorasick(special_tokens_matcher),
-            Splitter::Regex(regex),
-        ];
+        let mut splitters = vec![Splitter::AhoCorasick(special_tokens_matcher)];
+        splitters.extend(regexes);
 
-        Self::from_vocab_and_splitters(vocab, special_vocab, merge_priorities, splitters)
-    }
-
-    fn from_vocab_and_splitters(
-        vocab: Vec<Token>,
-        special_vocab: Vec<Token>,
-        merge_priorities: Option<HashMap<(Word, Word), Rank>>,
-        splitters: Vec<Splitter>,
-    ) -> Result<Self, Error> {
         let mut encoder = EncoderMap::default();
         let mut decoder = DecoderMap::default();
 
@@ -186,17 +182,16 @@ impl Tokenizer {
             .enumerate()
             .map(|(right_index, byte)| {
                 let word = Word::from_bytes(std::slice::from_ref(byte));
-                Ok(WordState {
-                    rank: self
-                        .encoder
-                        .get(&word)
-                        .copied()
-                        .ok_or(Error::NoTokenForByte(*byte))?,
-                    word,
-                    left_index: right_index.wrapping_sub(1),
-                    right_index,
-                    is_removed: false,
-                })
+                match self.encoder.get(&word) {
+                    Some(rank) => Ok(WordState {
+                        rank: *rank,
+                        word,
+                        left_index: right_index.wrapping_sub(1),
+                        right_index,
+                        is_removed: false,
+                    }),
+                    None => Err(Error::NoTokenForByte(*byte)),
+                }
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
@@ -217,14 +212,17 @@ impl Tokenizer {
 
         impl Ord for Match {
             fn cmp(&self, other: &Self) -> Ordering {
-                match (self.priority, other.priority, self.rank, other.rank) {
+                match match (self.priority, other.priority, self.rank, other.rank) {
                     (Some(a), Some(b), _, _) => b.cmp(&a),
                     (Some(_), None, _, _) => Ordering::Greater,
                     (None, Some(_), _, _) => Ordering::Less,
-                    (_, _, Some(a), Some(b)) => a.cmp(&b),
+                    (_, _, Some(a), Some(b)) => b.cmp(&a),
                     (_, _, Some(_), None) => Ordering::Greater,
                     (_, _, None, Some(_)) => Ordering::Less,
                     (None, None, None, None) => Ordering::Equal,
+                } {
+                    Ordering::Equal => other.left_index.cmp(&self.left_index),
+                    o => o,
                 }
             }
         }
@@ -241,8 +239,6 @@ impl Tokenizer {
                         .merge_priorities
                         .as_ref()
                         .and_then(|m| m.get(&(left.clone(), right.clone())).copied());
-                    
-                    
 
                     (
                         left_index,
@@ -272,11 +268,9 @@ impl Tokenizer {
             else {
                 break;
             };
-            
 
             let consumed_word = word_states.get(consumed_word_index).unwrap();
             let new_word = word_states.get(new_word_index).unwrap();
-
 
             if let Some((left_match_index, left_match_left_index, left_word)) = matches_queue
                 .get(&new_word.left_index)

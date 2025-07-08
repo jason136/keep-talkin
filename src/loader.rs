@@ -5,12 +5,10 @@ use std::{
     path::Path,
 };
 
-use aho_corasick::AhoCorasick;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use pcre2::bytes::Regex;
 use serde::Deserialize;
 
-use crate::{Error, NoOpHasher, Rank, Splitter, Token, Tokenizer, Word};
+use crate::{Error, Rank, Token, Tokenizer, Word};
 
 #[derive(Deserialize)]
 struct HuggingFaceTokenizer {
@@ -105,19 +103,18 @@ impl Tokenizer {
             })
             .collect::<Vec<_>>();
 
-        let total_merges = hf_tokenizer.model.merges.len();
         let merges_priorities = hf_tokenizer
             .model
             .merges
             .into_iter()
             .enumerate()
-            .filter_map(|(i, merge)| {
+            .map(|(i, merge)| {
                 let (left, right) = match merge {
                     HuggingFaceMerge::Array((left, right)) => (left, right),
                     HuggingFaceMerge::Delimited(merge) => {
                         let parts: Vec<&str> = merge.split(' ').collect();
                         if parts.len() != 2 {
-                            return None;
+                            return Err(Error::InvalidModelFormat);
                         }
                         (parts[0].to_string(), parts[1].to_string())
                     }
@@ -125,19 +122,10 @@ impl Tokenizer {
 
                 let left_word = Word::from_bytes(&reverse_byte_level(&left));
                 let right_word = Word::from_bytes(&reverse_byte_level(&right));
-                
 
-                // Only include merge if the result actually exists in the vocabulary
-                let combined_token = left.clone() + &right;
-                if vocab_map.contains_key(&combined_token) {
-                    Some(((left_word, right_word), i as Rank))
-                } else {
-                    None
-                }
+                Ok(((left_word, right_word), i as Rank))
             })
-            .collect::<HashMap<_, _>>();
-            
-            
+            .collect::<Result<HashMap<_, _>, Error>>()?;
 
         let special_vocab = hf_tokenizer
             .added_tokens
@@ -149,37 +137,33 @@ impl Tokenizer {
             })
             .collect::<Vec<_>>();
 
-        let aho_corasick_splitter = Splitter::AhoCorasick(AhoCorasick::new(
-            special_vocab.iter().map(|token| token.bytes.as_slice()),
-        )?);
-
-        let mut splitters = vec![aho_corasick_splitter];
-
-        if let HuggingFacePreTokenizer::Sequence { pretokenizers } = hf_tokenizer.pre_tokenizer {
+        let regexes = if let HuggingFacePreTokenizer::Sequence { mut pretokenizers } =
+            hf_tokenizer.pre_tokenizer
+        {
             if pretokenizers.len() < 2 {
                 return Err(Error::UnexpectedPreTokenizer);
             }
 
-            let (last, rest) = pretokenizers.split_last().ok_or(Error::EmptyPreTokenizer)?;
+            let last = pretokenizers.pop().ok_or(Error::EmptyPreTokenizer)?;
 
             if !matches!(last, HuggingFaceSubPreTokenizer::ByteLevel { .. }) {
                 return Err(Error::UnexpectedPreTokenizer);
             }
 
-            let regex_splitters = rest
-                .iter()
+            pretokenizers
+                .into_iter()
                 .map(|sub_tokenizer| match sub_tokenizer {
                     HuggingFaceSubPreTokenizer::Split {
                         pattern: HuggingFacePattern::Regex(regex),
-                    } => Ok(Splitter::Regex(Regex::new(&regex)?)),
+                    } => Ok(regex),
                     _ => Err(Error::UnexpectedPreTokenizer),
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![]
+        };
 
-            splitters.extend(regex_splitters);
-        }
-
-        Tokenizer::from_vocab_and_splitters(vocab, special_vocab, Some(merges_priorities), splitters)
+        Tokenizer::from_vocab_and_regex(vocab, special_vocab, Some(merges_priorities), regexes)
     }
 }
 
@@ -236,7 +220,7 @@ impl Tokenizer {
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, regex_pattern)
+        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, vec![regex_pattern])
     }
 }
 
@@ -289,7 +273,7 @@ impl Tokenizer {
             .collect();
 
         let pattern = &tekken.config.pattern;
-        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, pattern)
+        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, vec![pattern])
     }
 }
 

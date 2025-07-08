@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 
-use hf_hub::api::sync::{ApiBuilder, ApiError};
-use keep_talkin::{Error, Tokenizer};
+use keep_talkin::Tokenizer;
 use tokenizers::Tokenizer as HfTokenizer;
 
 mod common;
@@ -29,17 +28,17 @@ fn test_compatibility() {
             let decoded_bytes = our_decoded_bytes.concat();
             let our_decoded = String::from_utf8_lossy(&decoded_bytes);
 
-            assert_eq!(
-                hf_decoded, our_decoded,
-                "Decode mismatch for model {} on corpus text {}",
-                model_name, corpus_name
-            );
-
             println!("hf_decoded: {:?}", hf_decoded);
             println!("our_decoded: {:?}", our_decoded);
 
             println!("num hf tokens: {}", hf_tokens.len());
             println!("num our tokens: {}", our_tokens.len());
+
+            assert_eq!(
+                hf_decoded, our_decoded,
+                "Decode mismatch for model {} on corpus text {}",
+                model_name, corpus_name
+            );
 
             for (hf_token, our_token) in hf_tokens.iter().zip(our_tokens.iter()) {
                 assert_eq!(
