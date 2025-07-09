@@ -10,14 +10,18 @@ use priority_queue::PriorityQueue;
 use rayon::prelude::*;
 use thiserror::Error;
 
+#[cfg(feature = "pyo3")]
+pub mod bindings;
 pub mod loader;
+
+#[cfg(feature = "pyo3")]
+use pyo3::{prelude::*, types::PyModule};
 
 pub type Rank = u32;
 
 type EncoderMap = HashMap<Word, Rank, NoOpHasher>;
 type DecoderMap = HashMap<Rank, Vec<u8>, NoOpHasher>;
 
-#[derive(Debug)]
 pub struct Token {
     pub bytes: Vec<u8>,
     pub rank: Rank,
@@ -108,6 +112,17 @@ impl Tokenizer {
             })
     }
 
+    pub fn decode_batch<T, I>(&self, tokens: T) -> Result<Vec<Vec<&[u8]>>, Error>
+    where
+        T: IntoParallelIterator<Item = I>,
+        I: AsRef<[Rank]>,
+    {
+        tokens
+            .into_par_iter()
+            .map(|token| self.decode(token.as_ref()))
+            .collect::<Result<Vec<_>, Error>>()
+    }
+
     pub fn encode(
         &self,
         text: &[u8],
@@ -164,8 +179,18 @@ impl Tokenizer {
             })
     }
 
+    pub fn encode_batch<T, I>(&self, texts: T) -> Result<Vec<Vec<Rank>>, Error>
+    where
+        T: IntoParallelIterator<Item = I>,
+        I: AsRef<[u8]>,
+    {
+        texts
+            .into_par_iter()
+            .map(|text| self.encode(text.as_ref(), &HashSet::new()))
+            .collect()
+    }
+
     fn bpe_merge(&self, chunk: &[u8]) -> Result<Vec<Rank>, Error> {
-        #[derive(Debug, Clone)]
         struct WordState {
             word: Word,
             left_index: usize,
@@ -192,7 +217,7 @@ impl Tokenizer {
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        #[derive(PartialEq, Eq, Debug)]
+        #[derive(PartialEq, Eq)]
         struct Match {
             left_index: usize,
             right_index: usize,
@@ -282,7 +307,7 @@ impl Tokenizer {
                 .get(&consumed_word.right_index)
                 .map(|(i, m)| (*i, m.right_index, word_states.get(m.right_index).unwrap()))
             {
-                let right_new_combined = Word::combine(&combined.clone(), &right_word.word);
+                let right_new_combined = Word::combine(&combined, &right_word.word);
                 let right_new_rank = self.encoder.get(&right_new_combined).copied();
 
                 matches_queue.change_priority(
@@ -318,13 +343,11 @@ impl Tokenizer {
     }
 }
 
-#[derive(Debug)]
 pub enum Splitter {
     AhoCorasick(AhoCorasick),
     Regex(Regex),
 }
 
-#[derive(Debug)]
 enum Split<'a> {
     Finished(&'a [u8]),
     Unfinished(&'a [u8]),
@@ -369,7 +392,6 @@ impl Splitter {
     }
 }
 
-#[derive(Debug, Clone)]
 struct Word {
     hash: u64,
     length: usize,
@@ -417,7 +439,7 @@ fn pow_mod(mut base: u64, mut exp: usize, modulus: u64) -> u64 {
     result
 }
 
-#[derive(Default, Debug)]
+#[derive(Default)]
 struct NoOpHasher {
     hash: u64,
 }
@@ -503,4 +525,13 @@ pub enum Error {
 
     #[error("empty pre-tokenizer")]
     EmptyPreTokenizer,
+}
+
+#[cfg(feature = "pyo3")]
+#[pymodule]
+fn keep_talkin(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<bindings::Tokenizer>()?;
+    m.add_class::<bindings::Token>()?;
+    bindings::register_exceptions(py, m)?;
+    Ok(())
 }

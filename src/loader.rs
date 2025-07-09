@@ -90,7 +90,7 @@ impl Tokenizer {
         let vocab = vocab_map
             .iter()
             .map(|(token_str, rank)| Token {
-                bytes: reverse_byte_level(&token_str),
+                bytes: reverse_byte_level(token_str),
                 rank: *rank,
             })
             .collect::<Vec<_>>();
