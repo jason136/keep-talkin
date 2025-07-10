@@ -1,4 +1,4 @@
-use std::{collections::HashSet, hint::black_box};
+use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use keep_talkin::Tokenizer;
@@ -34,11 +34,7 @@ fn bench_encode(c: &mut Criterion) {
         encode_group.bench_function(model_name, |b| {
             b.iter(|| {
                 for (_corpus_name, text) in &corpus_texts {
-                    black_box(
-                        tokenizer
-                            .encode(black_box(text.as_bytes()), &HashSet::new())
-                            .unwrap(),
-                    );
+                    black_box(tokenizer.encode(black_box(text.as_bytes())).unwrap());
                 }
             })
         });
@@ -87,7 +83,7 @@ fn bench_decode(c: &mut Criterion) {
     for (tokenizer, (model_name, _)) in tokenizers.iter().zip(&tokenizer_configs) {
         let encoded_corpus_texts = corpus_texts
             .iter()
-            .map(|(_corpus_name, text)| tokenizer.encode(text.as_bytes(), &HashSet::new()).unwrap())
+            .map(|(_corpus_name, text)| tokenizer.encode(text.as_bytes()).unwrap())
             .collect::<Vec<_>>();
 
         decode_group.bench_function(model_name, |b| {
@@ -115,7 +111,7 @@ fn bench_decode_batch(c: &mut Criterion) {
     for (tokenizer, (model_name, _)) in tokenizers.iter().zip(&tokenizer_configs) {
         let encoded_corpus_texts = corpus_texts
             .iter()
-            .map(|(_corpus_name, text)| tokenizer.encode(text.as_bytes(), &HashSet::new()).unwrap())
+            .map(|(_corpus_name, text)| tokenizer.encode(text.as_bytes()).unwrap())
             .collect::<Vec<_>>();
 
         decode_batch_group.bench_function(model_name, |b| {

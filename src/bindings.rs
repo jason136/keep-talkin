@@ -86,27 +86,10 @@ impl Tokenizer {
         text: &str,
         allowed_special: Option<Vec<String>>,
     ) -> PyResult<Vec<Rank>> {
-        let start = std::time::Instant::now();
-        println!("START: {:?}", start);
-
-        let tokens = py.allow_threads(|| {
-            let alloc_start = std::time::Instant::now();
+        py.allow_threads(|| {
             let bytes = text.as_bytes();
-            let allowed_special_set = allowed_special
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<HashSet<_>>();
-            println!("BYTES_CONV: {:?}ms", alloc_start.elapsed().as_millis());
-
-            let encode_start = std::time::Instant::now();
-            let result = self.inner.encode(bytes, &allowed_special_set)?;
-            println!("ENCODE: {:?}ms", encode_start.elapsed().as_millis());
-            
-            Ok(result)
-        });
-
-        println!("TOTAL: {:?}ms", start.elapsed().as_millis());
-        tokens
+            Ok(self.inner.encode(bytes)?)
+        })
     }
 
     #[pyo3(signature = (data, *, allowed_special=None))]
@@ -116,14 +99,7 @@ impl Tokenizer {
         data: &[u8],
         allowed_special: Option<Vec<String>>,
     ) -> PyResult<Vec<Rank>> {
-        py.allow_threads(|| {
-            let allowed_special_set = allowed_special
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<HashSet<_>>();
-
-            Ok(self.inner.encode(data, &allowed_special_set)?)
-        })
+        py.allow_threads(|| Ok(self.inner.encode(data)?))
     }
 
     fn decode(&self, py: Python, tokens: Vec<Rank>) -> PyResult<String> {
