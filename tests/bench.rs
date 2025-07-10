@@ -63,7 +63,7 @@ fn bench_encode_batch(c: &mut Criterion) {
                 for (_corpus_name, text) in &corpus_texts {
                     black_box(
                         tokenizer
-                            .encode_batch(black_box(vec![text.as_bytes(); 10]))
+                            .encode_batch(black_box(vec![text.as_bytes(); 100]))
                             .unwrap(),
                     );
                 }
@@ -123,7 +123,7 @@ fn bench_decode_batch(c: &mut Criterion) {
                 for tokens in &encoded_corpus_texts {
                     black_box(
                         tokenizer
-                            .decode_batch(black_box(&vec![tokens.as_slice(); 10]))
+                            .decode_batch(black_box(&vec![tokens.as_slice(); 100]))
                             .unwrap(),
                     );
                 }

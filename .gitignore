@@ -1,4 +1,5 @@
 debug
 target
+.venv
 tests/configs
 tests/corpus

@@ -4,14 +4,14 @@ use hf_hub::api::sync::{ApiBuilder, ApiError};
 use keep_talkin::Error;
 
 pub(crate) const TEST_MODELS: &[&str] = &[
-    // "meta-llama/Meta-Llama-3-70B-Instruct",
+    "meta-llama/Meta-Llama-3-70B-Instruct",
     // "meta-llama/Llama-3.1-405B-Instruct",
     // "meta-llama/Llama-3.2-90B-Vision-Instruct",
     // "meta-llama/Llama-3.3-70B-Instruct",
-    // "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+    "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
     // "mistralai/Mistral-Small-24B-Instruct-2501",
     // "mistralai/Mixtral-8x22B-v0.1",
-    "deepseek-ai/DeepSeek-V3-0324",
+    // "deepseek-ai/DeepSeek-V3-0324",
     "deepseek-ai/DeepSeek-R1-0528",
 ];
 
