@@ -1,7 +1,6 @@
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyType};
-use std::collections::HashSet;
 
 use crate::{Error, Rank};
 
@@ -79,38 +78,11 @@ impl Tokenizer {
         })
     }
 
-    #[pyo3(signature = (text, *, allowed_special=None))]
-    fn encode(
-        &self,
-        py: Python,
-        text: &str,
-        allowed_special: Option<Vec<String>>,
-    ) -> PyResult<Vec<Rank>> {
-        py.allow_threads(|| {
-            let bytes = text.as_bytes();
-            Ok(self.inner.encode(bytes)?)
-        })
-    }
-
-    #[pyo3(signature = (data, *, allowed_special=None))]
-    fn encode_bytes(
-        &self,
-        py: Python,
-        data: &[u8],
-        allowed_special: Option<Vec<String>>,
-    ) -> PyResult<Vec<Rank>> {
+    fn encode(&self, py: Python, data: &[u8]) -> PyResult<Vec<Rank>> {
         py.allow_threads(|| Ok(self.inner.encode(data)?))
     }
 
-    fn decode(&self, py: Python, tokens: Vec<Rank>) -> PyResult<String> {
-        py.allow_threads(|| {
-            let decoded = self.inner.decode(&tokens)?;
-            let bytes = decoded.into_iter().flatten().copied().collect::<Vec<_>>();
-            Ok(String::from_utf8(bytes)?)
-        })
-    }
-
-    fn decode_bytes(&self, py: Python, tokens: Vec<Rank>) -> PyResult<PyObject> {
+    fn decode(&self, py: Python, tokens: Vec<Rank>) -> PyResult<PyObject> {
         let bytes = py.allow_threads(|| {
             let decoded = self.inner.decode(&tokens)?;
             Ok::<_, Error>(decoded.into_iter().flatten().copied().collect::<Vec<_>>())
@@ -119,66 +91,13 @@ impl Tokenizer {
         Ok(PyBytes::new(py, &bytes).into())
     }
 
-    #[pyo3(signature = (texts, *, allowed_special=None))]
-    fn encode_batch(
-        &self,
-        py: Python,
-        texts: Vec<String>,
-        allowed_special: Option<Vec<String>>,
-    ) -> PyResult<Vec<Vec<Rank>>> {
-        py.allow_threads(|| {
-            let byte_texts = texts.iter().map(|text| text.as_bytes()).collect::<Vec<_>>();
-            let _allowed_special_set = allowed_special
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<HashSet<_>>();
-            Ok(self.inner.encode_batch(byte_texts)?)
-        })
+    fn encode_batch(&self, py: Python, data: Vec<Vec<u8>>) -> PyResult<Vec<Vec<Rank>>> {
+        py.allow_threads(|| Ok(self.inner.encode_batch(data)?))
     }
 
-    #[pyo3(signature = (data, *, allowed_special=None))]
-    fn encode_bytes_batch(
-        &self,
-        py: Python,
-        data: Vec<Vec<u8>>,
-        allowed_special: Option<Vec<String>>,
-    ) -> PyResult<Vec<Vec<Rank>>> {
-        py.allow_threads(|| {
-            let byte_refs = data
-                .iter()
-                .map(|bytes| bytes.as_slice())
-                .collect::<Vec<_>>();
-            let _allowed_special_set = allowed_special
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<HashSet<_>>();
-            Ok(self.inner.encode_batch(byte_refs)?)
-        })
-    }
-
-    fn decode_batch(&self, py: Python, tokens: Vec<Vec<Rank>>) -> PyResult<Vec<String>> {
-        py.allow_threads(|| {
-            let token_refs = tokens.iter().map(|t| t.as_slice()).collect::<Vec<_>>();
-            let decoded = self.inner.decode_batch(token_refs)?;
-
-            decoded
-                .into_iter()
-                .map(|token_bytes| {
-                    let bytes = token_bytes
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        .collect::<Vec<_>>();
-                    Ok(String::from_utf8(bytes)?)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-    }
-
-    fn decode_bytes_batch(&self, py: Python, tokens: Vec<Vec<Rank>>) -> PyResult<Vec<PyObject>> {
+    fn decode_batch(&self, py: Python, tokens: Vec<Vec<Rank>>) -> PyResult<Vec<PyObject>> {
         let batch_bytes = py.allow_threads(|| {
-            let token_refs = tokens.iter().map(|t| t.as_slice()).collect::<Vec<_>>();
-            let decoded = self.inner.decode_batch(token_refs)?;
+            let decoded = self.inner.decode_batch(tokens)?;
 
             Ok::<_, Error>(
                 decoded
