@@ -5,13 +5,13 @@ use keep_talkin::Error;
 
 pub(crate) const TEST_MODELS: &[&str] = &[
     "meta-llama/Meta-Llama-3-70B-Instruct",
-    // "meta-llama/Llama-3.1-405B-Instruct",
-    // "meta-llama/Llama-3.2-90B-Vision-Instruct",
-    // "meta-llama/Llama-3.3-70B-Instruct",
+    "meta-llama/Llama-3.1-405B-Instruct",
+    "meta-llama/Llama-3.2-90B-Vision-Instruct",
+    "meta-llama/Llama-3.3-70B-Instruct",
     "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
-    // "mistralai/Mistral-Small-24B-Instruct-2501",
+    "mistralai/Mistral-Small-24B-Instruct-2501",
     // "mistralai/Mixtral-8x22B-v0.1",
-    // "deepseek-ai/DeepSeek-V3-0324",
+    "deepseek-ai/DeepSeek-V3-0324",
     "deepseek-ai/DeepSeek-R1-0528",
 ];
 
@@ -64,19 +64,19 @@ pub(crate) fn load_corpus_files() -> Result<Vec<(String, String)>, Error> {
     let corpus_dir = PathBuf::from("tests/corpus");
     fs::create_dir_all(&corpus_dir)?;
 
-    // for (filename, url) in CORPUS_FILES {
-    //     let file_path = corpus_dir.join(filename);
-    //     if !file_path.exists() {
-    //         let response = reqwest::blocking::get(*url)
-    //             .map_err(|e| Error::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    for (filename, url) in CORPUS_FILES {
+        let file_path = corpus_dir.join(filename);
+        if !file_path.exists() {
+            let response = reqwest::blocking::get(*url)
+                .map_err(|e| Error::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-    //         let content = response
-    //             .text()
-    //             .map_err(|e| Error::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let content = response
+                .text()
+                .map_err(|e| Error::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-    //         fs::write(&file_path, content)?;
-    //     }
-    // }
+            fs::write(&file_path, content)?;
+        }
+    }
 
     Ok(fs::read_dir(corpus_dir)?
         .map(|entry| {

@@ -32,6 +32,7 @@ pub struct Tokenizer {
     special_encoder: EncoderMap,
     decoder: DecoderMap,
     special_tokens_decoder: DecoderMap,
+    prefix: Option<Vec<Rank>>,
     splitters: Vec<Splitter>,
 }
 
@@ -39,6 +40,7 @@ impl Tokenizer {
     fn from_vocab_and_regex(
         vocab: Vec<Token>,
         special_vocab: Vec<Token>,
+        prefix: Option<Vec<Rank>>,
         regex_patterns: Vec<impl AsRef<str>>,
     ) -> Result<Self, Error> {
         let special_tokens_matcher = AhoCorasickBuilder::new()
@@ -88,6 +90,7 @@ impl Tokenizer {
             special_encoder,
             decoder,
             special_tokens_decoder,
+            prefix,
             splitters,
         })
     }
@@ -129,8 +132,7 @@ impl Tokenizer {
     }
 
     pub fn encode(&self, text: &[u8]) -> Result<Vec<Rank>, Error> {
-        let result = self
-            .splitters
+        self.splitters
             .iter()
             .try_fold(
                 {
@@ -166,18 +168,22 @@ impl Tokenizer {
                         })
                 },
             )?
-            .into_par_iter()
+            .par_iter()
             .try_fold(
                 || {
                     Self::RANK_SHARED_BUFFER.with(|buffer| {
                         buffer.prepare(text.len() / 4);
-                        buffer.take_buffer()
+                        let mut ranks = buffer.take_buffer();
+                        if let Some(prefix) = &self.prefix {
+                            ranks.extend_from_slice(prefix);
+                        }
+                        ranks
                     })
                 },
                 |mut acc, split| {
                     match split {
                         Split::Literal(r) => {
-                            let bytes = &text[r];
+                            let bytes = &text[r.start..r.end];
                             if let Some(rank) = self.special_encoder.get(&Word::from_bytes(bytes)) {
                                 acc.push(*rank);
                             } else if let Some(rank) = self.encoder.get(&Word::from_bytes(bytes)) {
@@ -189,7 +195,7 @@ impl Tokenizer {
                             }
                         }
                         Split::Bytes(r) => {
-                            let bytes = &text[r];
+                            let bytes = &text[r.start..r.end];
                             if let Some(rank) = self.encoder.get(&Word::from_bytes(bytes)) {
                                 acc.push(*rank);
                             } else {
@@ -207,9 +213,7 @@ impl Tokenizer {
                 Self::RANK_SHARED_BUFFER.with(|buffer| buffer.return_buffer(b));
 
                 Ok(a)
-            })?;
-
-        Ok(result)
+            })
     }
 
     pub fn encode_batch<T, I>(&self, texts: T) -> Result<Vec<Vec<Rank>>, Error>
@@ -323,13 +327,11 @@ impl Tokenizer {
                 matches[match_index].is_removed = true;
             }
 
-            output.extend(word_states.iter().filter_map(|w| {
-                if w.is_removed {
-                    None
-                } else {
-                    Some(w.rank)
-                }
-            }));
+            output.extend(
+                word_states
+                    .iter()
+                    .filter_map(|w| (!w.is_removed).then_some(w.rank)),
+            );
 
             Ok(())
         })
@@ -427,52 +429,66 @@ impl<T> Buffer<T> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Word {
     hash: u64,
     length: usize,
+    checksum: u8,
 }
 
-const HASH_BASE: u64 = 257;
-const HASH_MOD: u64 = (1u64 << 31) - 1;
-
 impl Word {
+    const HASH_BASE: u64 = 257;
+    const HASH_MOD: u64 = (1u64 << 31) - 1;
+
     pub fn from_bytes(seq: &[u8]) -> Self {
         let mut hash = 0u64;
+        let mut checksum = 0u8;
         for &byte in seq {
-            hash = (hash * HASH_BASE + byte as u64) % HASH_MOD;
+            hash = (hash * Self::HASH_BASE + byte as u64) % Self::HASH_MOD;
+            checksum ^= byte;
         }
         Self {
             hash,
             length: seq.len(),
+            checksum,
         }
     }
 
     pub fn combine(left: &Self, right: &Self) -> Self {
-        let base_pow = pow_mod(HASH_BASE, right.length, HASH_MOD);
-        let left_shifted = (left.hash * base_pow) % HASH_MOD;
-        let combined_hash = (left_shifted + right.hash) % HASH_MOD;
+        let base_pow = Self::pow_mod(Self::HASH_BASE, right.length);
+        let left_shifted = (left.hash * base_pow) % Self::HASH_MOD;
+        let combined_hash = (left_shifted + right.hash) % Self::HASH_MOD;
 
         Self {
             hash: combined_hash,
+            checksum: left.checksum ^ right.checksum,
             length: left.length + right.length,
         }
     }
+
+    fn pow_mod(mut base: u64, mut exp: usize) -> u64 {
+        let mut result = 1u64;
+        base %= Self::HASH_MOD;
+
+        while exp > 0 {
+            if exp & 1 == 1 {
+                result = (result * base) % Self::HASH_MOD;
+            }
+            base = (base * base) % Self::HASH_MOD;
+            exp >>= 1;
+        }
+        result
+    }
 }
 
-fn pow_mod(mut base: u64, mut exp: usize, modulus: u64) -> u64 {
-    let mut result = 1u64;
-    base %= modulus;
-
-    while exp > 0 {
-        if exp & 1 == 1 {
-            result = (result * base) % modulus;
-        }
-        base = (base * base) % modulus;
-        exp >>= 1;
+impl Hash for Word {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let combined = self
+            .hash
+            .wrapping_mul(31)
+            .wrapping_add(self.length as u64 ^ self.checksum as u64);
+        state.write_u64(combined);
     }
-
-    result
 }
 
 #[derive(Default)]
@@ -507,20 +523,6 @@ impl BuildHasher for NoOpHasher {
 
     fn build_hasher(&self) -> Self::Hasher {
         NoOpHasher::default()
-    }
-}
-
-impl PartialEq for Word {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.length == other.length
-    }
-}
-
-impl Eq for Word {}
-
-impl Hash for Word {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash.wrapping_mul(31).wrapping_add(self.length as u64));
     }
 }
 

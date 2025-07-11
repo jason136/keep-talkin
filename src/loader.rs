@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 
 use crate::{Error, Rank, Token, Tokenizer};
@@ -29,14 +29,8 @@ enum HuggingFacePreTokenizer {
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum HuggingFaceSubPreTokenizer {
-    Split {
-        pattern: HuggingFacePattern,
-    },
-    ByteLevel {
-        // add_prefix_space: bool,
-        // trim_offsets: bool,
-        // use_regex: bool,
-    },
+    Split { pattern: HuggingFacePattern },
+    ByteLevel,
 }
 
 #[derive(Deserialize)]
@@ -131,7 +125,7 @@ impl Tokenizer {
             vec![]
         };
 
-        Tokenizer::from_vocab_and_regex(vocab, special_vocab, regexes)
+        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, regexes)
     }
 }
 
@@ -165,7 +159,7 @@ impl Tokenizer {
                 };
 
                 Ok(Token {
-                    bytes: decode_token_bytes(token),
+                    bytes: decode_base64_tokens(token),
                     rank: rank_str.parse()?,
                 })
             })
@@ -182,13 +176,13 @@ impl Tokenizer {
             .filter(|(_, token)| token.special)
             .map(|(rank_str, token)| {
                 Ok(Token {
-                    bytes: decode_token_bytes(&token.content),
+                    bytes: decode_base64_tokens(&token.content),
                     rank: rank_str.parse()?,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        Tokenizer::from_vocab_and_regex(vocab, special_vocab, vec![regex_pattern])
+        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, vec![regex_pattern])
     }
 }
 
@@ -226,7 +220,7 @@ impl Tokenizer {
             .vocab
             .into_iter()
             .map(|tekken_token| Token {
-                bytes: decode_token_bytes(&tekken_token.token_bytes),
+                bytes: decode_base64_tokens(&tekken_token.token_bytes),
                 rank: tekken_token.rank,
             })
             .collect();
@@ -241,11 +235,11 @@ impl Tokenizer {
             .collect();
 
         let pattern = &tekken.config.pattern;
-        Tokenizer::from_vocab_and_regex(vocab, special_vocab, vec![pattern])
+        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, vec![pattern])
     }
 }
 
-fn decode_token_bytes(token: &str) -> Vec<u8> {
+fn decode_base64_tokens(token: &str) -> Vec<u8> {
     if token.starts_with('<') && token.ends_with('>') {
         return token.as_bytes().to_vec();
     }
