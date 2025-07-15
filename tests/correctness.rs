@@ -8,7 +8,7 @@ use common::{load_corpus_files, load_tokenizer_configs};
 
 #[test]
 fn test_compatibility() {
-    let corpus_texts = load_corpus_files().unwrap();
+    let corpus_texts = load_corpus_files().unwrap().into_iter().collect::<Vec<_>>();
     let tokenizer_configs = load_tokenizer_configs(None).unwrap();
 
     let corpus_bytes = corpus_texts
@@ -21,7 +21,11 @@ fn test_compatibility() {
         .map(|(_, text)| text.as_str())
         .collect::<Vec<_>>();
 
-    for (_, tokenizer_path) in tokenizer_configs.into_iter().take(1) {
+    println!("corpus_texts len: {}", corpus_texts.len());
+
+    for (tokenizer_name, tokenizer_path) in tokenizer_configs.into_iter() {
+        println!("tokenizer_name: {:?}", tokenizer_name);
+
         let hf_tokenizer = HfTokenizer::from_file(&tokenizer_path).unwrap();
         let our_tokenizer = Tokenizer::from_tokenizer_json(&tokenizer_path).unwrap();
 

@@ -23,7 +23,6 @@ enum HuggingFacePreTokenizer {
     Sequence {
         pretokenizers: Vec<HuggingFaceSubPreTokenizer>,
     },
-    ByteLevel,
 }
 
 #[derive(Deserialize)]
@@ -48,7 +47,16 @@ struct HuggingFaceAddedToken {
 
 #[derive(Deserialize)]
 struct HuggingFaceModel {
+    ignore_merges: Option<bool>,
     vocab: HashMap<String, Rank>,
+    merges: Vec<HuggingFaceMerge>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HuggingFaceMerge {
+    String(String),
+    Array(Vec<String>),
 }
 
 impl Tokenizer {
@@ -56,29 +64,6 @@ impl Tokenizer {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let hf_tokenizer: HuggingFaceTokenizer = serde_json::from_reader(reader)?;
-
-        fn reverse_byte_level(token_str: &str) -> Vec<u8> {
-            token_str
-                .chars()
-                .map(|c| {
-                    let unicode_val = c as u32;
-                    match unicode_val {
-                        33..=126 => unicode_val as u8,
-                        161..=172 | 174..=255 => unicode_val as u8,
-                        0x100..=0x17F => {
-                            let offset = unicode_val - 0x100;
-                            match offset {
-                                0..=32 => offset as u8,
-                                33..=66 => (offset + 94) as u8,
-                                67 => 173,
-                                _ => unicode_val as u8,
-                            }
-                        }
-                        _ => unicode_val as u8,
-                    }
-                })
-                .collect()
-        }
 
         let vocab_map = hf_tokenizer.model.vocab.clone();
         let vocab = vocab_map
@@ -88,6 +73,33 @@ impl Tokenizer {
                 rank: *rank,
             })
             .collect::<Vec<_>>();
+
+        let merges = if hf_tokenizer.model.ignore_merges.unwrap_or(false) {
+            None
+        } else {
+            Some(
+                hf_tokenizer
+                    .model
+                    .merges
+                    .into_iter()
+                    .map(|merge| {
+                        let vecs = match merge {
+                            HuggingFaceMerge::String(merge) => {
+                                merge.split(' ').map(|s| s.to_string()).collect::<Vec<_>>()
+                            }
+                            HuggingFaceMerge::Array(merges) => merges,
+                        };
+
+                        let mut parts = vecs.into_iter();
+                        let (Some(left), Some(right)) = (parts.next(), parts.next()) else {
+                            return Err(Error::InvalidModelFormat);
+                        };
+
+                        Ok((reverse_byte_level(&left), reverse_byte_level(&right)))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?,
+            )
+        };
 
         let special_vocab = hf_tokenizer
             .added_tokens
@@ -99,33 +111,29 @@ impl Tokenizer {
             })
             .collect::<Vec<_>>();
 
-        let regexes = if let HuggingFacePreTokenizer::Sequence { mut pretokenizers } =
-            hf_tokenizer.pre_tokenizer
-        {
-            if pretokenizers.len() < 2 {
-                return Err(Error::UnexpectedPreTokenizer);
-            }
+        let HuggingFacePreTokenizer::Sequence { mut pretokenizers } = hf_tokenizer.pre_tokenizer;
 
-            let last = pretokenizers.pop().ok_or(Error::EmptyPreTokenizer)?;
+        if pretokenizers.len() < 2 {
+            return Err(Error::UnexpectedPreTokenizer);
+        }
 
-            if !matches!(last, HuggingFaceSubPreTokenizer::ByteLevel { .. }) {
-                return Err(Error::UnexpectedPreTokenizer);
-            }
+        let last = pretokenizers.pop().ok_or(Error::EmptyPreTokenizer)?;
 
-            pretokenizers
-                .into_iter()
-                .map(|sub_tokenizer| match sub_tokenizer {
-                    HuggingFaceSubPreTokenizer::Split {
-                        pattern: HuggingFacePattern::Regex(regex),
-                    } => Ok(regex),
-                    _ => Err(Error::UnexpectedPreTokenizer),
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            vec![]
-        };
+        if !matches!(last, HuggingFaceSubPreTokenizer::ByteLevel) {
+            return Err(Error::UnexpectedPreTokenizer);
+        }
 
-        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, regexes)
+        let regex_patterns = pretokenizers
+            .into_iter()
+            .map(|sub_tokenizer| match sub_tokenizer {
+                HuggingFaceSubPreTokenizer::Split {
+                    pattern: HuggingFacePattern::Regex(regex),
+                } => Ok(regex),
+                _ => Err(Error::UnexpectedPreTokenizer),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Tokenizer::from_vocab_and_regexes(vocab, special_vocab, merges, None, regex_patterns)
     }
 }
 
@@ -144,7 +152,7 @@ impl Tokenizer {
     pub fn from_model_and_config(
         model_path: impl AsRef<Path>,
         config_path: impl AsRef<Path>,
-        regex_pattern: &str,
+        regex_patterns: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<Self, Error> {
         let model_file = File::open(model_path)?;
         let model_reader = BufReader::new(model_file);
@@ -182,7 +190,16 @@ impl Tokenizer {
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, vec![regex_pattern])
+        Tokenizer::from_vocab_and_regexes(
+            vocab,
+            special_vocab,
+            None,
+            None,
+            regex_patterns
+                .into_iter()
+                .map(|r| r.as_ref().to_string())
+                .collect(),
+        )
     }
 }
 
@@ -234,9 +251,41 @@ impl Tokenizer {
             })
             .collect();
 
-        let pattern = &tekken.config.pattern;
-        Tokenizer::from_vocab_and_regex(vocab, special_vocab, None, vec![pattern])
+        Tokenizer::from_vocab_and_regexes(
+            vocab,
+            special_vocab,
+            None,
+            None,
+            vec![tekken.config.pattern],
+        )
     }
+}
+
+fn reverse_byte_level(token_str: &str) -> Vec<u8> {
+    if token_str.starts_with('<') && token_str.ends_with('>') {
+        return token_str.as_bytes().to_vec();
+    }
+
+    token_str
+        .chars()
+        .map(|c| {
+            let unicode_val = c as u32;
+            match unicode_val {
+                33..=126 => unicode_val as u8,
+                161..=172 | 174..=255 => unicode_val as u8,
+                0x100..=0x17F => {
+                    let offset = unicode_val - 0x100;
+                    match offset {
+                        0..=32 => offset as u8,
+                        33..=66 => (offset + 94) as u8,
+                        67 => 173,
+                        _ => unicode_val as u8,
+                    }
+                }
+                _ => unicode_val as u8,
+            }
+        })
+        .collect()
 }
 
 fn decode_base64_tokens(token: &str) -> Vec<u8> {
