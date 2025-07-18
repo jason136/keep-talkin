@@ -49,7 +49,3 @@ harness = false
 [[test]]
 name = "correctness"
 path = "tests/correctness.rs"
-
-[[test]]
-name = "debug_merge"
-path = "tests/debug_merge.rs"

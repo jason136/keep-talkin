@@ -1,22 +1,25 @@
 use std::{
+    borrow::Cow,
     cell::{RefCell, RefMut},
     cmp::Ordering,
     collections::HashMap,
     ops::Range,
 };
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use pcre2::bytes::{Regex, RegexBuilder};
+use aho_corasick::{AhoCorasickBuilder, MatchKind};
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use thiserror::Error;
 
 #[cfg(feature = "pyo3")]
-pub mod bindings;
-pub mod loader;
+mod bindings;
+pub mod loaders;
+pub(crate) mod splitters;
 
 #[cfg(feature = "pyo3")]
 use pyo3::{prelude::*, types::PyModule};
+
+use crate::splitters::{Split, Splitter, WordSplitter};
 
 pub type Rank = u32;
 
@@ -39,17 +42,19 @@ pub struct Tokenizer {
     special_encoder: SpecialEncoderMap,
     decoder: DecoderMap,
     special_tokens_decoder: DecoderMap,
-    prefix: Option<Vec<Rank>>,
+    prefix: Option<Vec<u8>>,
     splitters: Vec<Splitter>,
+    word_splitter: WordSplitter,
 }
 
 impl Tokenizer {
-    pub fn from_vocab_and_regexes(
+    fn from_vocab_and_splitters(
         vocab: Vec<Token>,
         special_vocab: Vec<Token>,
         merges: Option<Vec<(Vec<u8>, Vec<u8>)>>,
-        prefix: Option<Vec<Rank>>,
-        regex_patterns: Vec<String>,
+        prefix: Option<Vec<u8>>,
+        splitters: Vec<Splitter>,
+        word_splitter: WordSplitter,
     ) -> Result<Self, Error> {
         let special_tokens_matcher = AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostLongest)
@@ -60,22 +65,8 @@ impl Tokenizer {
                     .collect::<Vec<_>>(),
             )?;
 
-        let mut splitters = vec![Splitter::AhoCorasick(special_tokens_matcher)];
-
-        for pattern in regex_patterns {
-            let regex_splitter = Splitter::Regex(
-                RegexBuilder::new()
-                    .jit_if_available(true)
-                    .max_jit_stack_size(Some(1024 * 1024))
-                    .utf(true)
-                    .ucp(true)
-                    .build(&pattern)?,
-            );
-            splitters.push(regex_splitter);
-        }
-
-        let mut encoder = EncoderMap::default();
-        let mut decoder = DecoderMap::default();
+        let mut splitters_acc = vec![Splitter::AhoCorasick(special_tokens_matcher)];
+        splitters_acc.extend(splitters);
 
         let mut merge_priorities_map = HashMap::new();
         if let Some(merges) = merges {
@@ -91,6 +82,9 @@ impl Tokenizer {
                         .insert(left_len, priority as Rank);
                 });
         };
+
+        let mut encoder = EncoderMap::default();
+        let mut decoder = DecoderMap::default();
 
         for item in vocab {
             let priorities = merge_priorities_map.get(&item.bytes).cloned();
@@ -118,28 +112,48 @@ impl Tokenizer {
             decoder,
             special_tokens_decoder,
             prefix,
-            splitters,
+            splitters: splitters_acc,
+            word_splitter,
         })
     }
 
     pub fn decode(&self, tokens: &[Rank]) -> Result<Vec<&[u8]>, Error> {
-        tokens
-            .par_iter()
-            .try_fold(Vec::new, |mut acc, token| {
-                if let Some(bytes) = self.decoder.get(token) {
-                    acc.push(bytes.as_slice());
-                } else if let Some(bytes) = self.special_tokens_decoder.get(token) {
-                    acc.push(bytes.as_slice());
-                } else {
-                    return Err(Error::InvalidToken(*token));
-                }
+        let get_bytes = |token: &Rank| -> Result<&[u8], Error> {
+            if let Some(bytes) = self.decoder.get(&token) {
+                Ok(bytes.as_slice())
+            } else if let Some(bytes) = self.special_tokens_decoder.get(&token) {
+                Ok(bytes.as_slice())
+            } else {
+                return Err(Error::InvalidToken(*token));
+            }
+        };
 
-                Ok(acc)
-            })
-            .try_reduce(Vec::new, |mut a, b| {
-                a.extend(b);
-                Ok(a)
-            })
+        let mut sequence = if tokens.len() < 1024 {
+            tokens
+                .iter()
+                .map(get_bytes)
+                .collect::<Result<Vec<_>, Error>>()
+        } else {
+            tokens
+                .par_iter()
+                .try_fold(Vec::new, |mut acc, token| {
+                    acc.push(get_bytes(token)?);
+                    Ok(acc)
+                })
+                .try_reduce(Vec::new, |mut a, b| {
+                    a.extend(b);
+                    Ok(a)
+                })
+        }?;
+
+        if let Some(prefix) = &self.prefix {
+            if sequence.first().map_or(false, |s| s.starts_with(prefix)) {
+                sequence[0] = &sequence[0][prefix.len()..];
+                return Ok(sequence);
+            }
+        }
+
+        Ok(sequence)
     }
 
     pub fn decode_batch<T, I>(&self, tokens: T) -> Result<Vec<Vec<&[u8]>>, Error>
@@ -159,6 +173,15 @@ impl Tokenizer {
     }
 
     pub fn encode(&self, text: &[u8]) -> Result<Vec<Rank>, Error> {
+        let text = if let Some(prefix) = &self.prefix {
+            let mut text_acc = Vec::with_capacity(prefix.len() + text.len());
+            text_acc.extend_from_slice(prefix);
+            text_acc.extend_from_slice(text);
+            Cow::Owned(text_acc)
+        } else {
+            Cow::Borrowed(text)
+        };
+
         self.splitters
             .iter()
             .try_fold(
@@ -202,11 +225,7 @@ impl Tokenizer {
                 || {
                     Self::RANK_SHARED_BUFFER.with(|buffer| {
                         buffer.prepare(text.len() / 4);
-                        let mut ranks = buffer.take_buffer();
-                        if let Some(prefix) = &self.prefix {
-                            ranks.extend_from_slice(prefix);
-                        }
-                        ranks
+                        buffer.take_buffer()
                     })
                 },
                 |mut acc, split| {
@@ -271,20 +290,19 @@ impl Tokenizer {
             let word_states = &mut *word_states_buffer.borrow_mut();
             let matches = &mut *matches_buffer.borrow_mut();
 
-            for (right_index, byte) in chunk.iter().enumerate() {
-                let word = std::slice::from_ref(byte);
-                match self.encoder.get(word) {
-                    Some(entry) => {
-                        word_states.push(WordState {
-                            rank: entry.rank,
-                            word: right_index..right_index + 1,
-                            left_index: right_index.wrapping_sub(1),
-                            right_index,
-                            is_removed: false,
-                        });
-                    }
-                    None => return Err(Error::NoTokenForByte(*byte)),
-                }
+            for (right_index, word_result) in self
+                .word_splitter
+                .into_iter(chunk, &self.encoder)
+                .enumerate()
+            {
+                let (word, rank) = word_result?;
+                word_states.push(WordState {
+                    rank,
+                    word,
+                    left_index: right_index.wrapping_sub(1),
+                    right_index,
+                    is_removed: false,
+                });
             }
 
             for (left_index, window) in word_states.windows(2).enumerate() {
@@ -419,55 +437,6 @@ impl Tokenizer {
     }
 }
 
-pub enum Splitter {
-    AhoCorasick(AhoCorasick),
-    Regex(Regex),
-}
-
-#[derive(Clone)]
-enum Split {
-    Literal(Range<usize>),
-    Bytes(Range<usize>),
-}
-
-impl Splitter {
-    fn split(&self, text: &[u8], offset: usize, output: &mut Vec<Split>) -> Result<(), Error> {
-        match self {
-            Splitter::AhoCorasick(aho_corasick) => {
-                let mut start = 0;
-                for m in aho_corasick.find_iter(text) {
-                    if m.start() > start {
-                        output.push(Split::Bytes(start + offset..m.start() + offset));
-                    }
-                    output.push(Split::Literal(m.start() + offset..m.end() + offset));
-                    start = m.end();
-                }
-                if start < text.len() {
-                    output.push(Split::Bytes(start + offset..text.len() + offset));
-                }
-
-                Ok(())
-            }
-            Splitter::Regex(regex) => {
-                let mut start = 0;
-                for m_result in regex.find_iter(text) {
-                    let m = m_result?;
-                    if m.start() > start {
-                        output.push(Split::Bytes(start + offset..m.start() + offset));
-                    }
-                    output.push(Split::Bytes(m.start() + offset..m.end() + offset));
-                    start = m.end();
-                }
-                if start < text.len() {
-                    output.push(Split::Bytes(start + offset..text.len() + offset));
-                }
-
-                Ok(())
-            }
-        }
-    }
-}
-
 struct WordState {
     word: Range<usize>,
     left_index: usize,
@@ -476,7 +445,7 @@ struct WordState {
     is_removed: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Match {
     word: Range<usize>,
     left_index: usize,
@@ -525,8 +494,14 @@ pub enum Error {
     #[error("token not found in vocabulary: {0}")]
     NoValidToken(String),
 
-    #[error("token not found in vocabulary during bpe encoding: {0}")]
-    NoTokenForByte(u8),
+    #[error("token not found in vocabulary during bpe encoding: {0:?}")]
+    NoTokenForWord(Vec<u8>),
+
+    #[error("invalid unicode sequence detected: {0:?}")]
+    InvalidUnicodeSequence(Vec<u8>),
+
+    #[error("token not found in vocabulary during prefix decoding: {0:?}")]
+    NoPrefixToken(Vec<u8>),
 
     #[error("io error: {0}")]
     IoError(#[from] std::io::Error),
@@ -540,14 +515,20 @@ pub enum Error {
     #[error("parse integer error: {0}")]
     ParseIntError(#[from] std::num::ParseIntError),
 
+    #[error("utf-8 encode error: {0}")]
+    Utf8EncodeError(#[from] std::string::FromUtf8Error),
+
     #[error("invalid model format: expected '{{token}} {{rank}}' per line")]
     InvalidModelFormat,
 
-    #[error("invalid model format: expected regex pre-tokenizer")]
-    UnexpectedPreTokenizer,
+    #[error("unsupported normalizer and pretokenizer combination")]
+    UnsupportedNormalizerPretokenizer,
 
-    #[error("empty pre-tokenizer")]
-    EmptyPreTokenizer,
+    #[error("unexpected non-regex splitter pre-tokenizer")]
+    UnexpectedNonRegexSplitter,
+
+    #[error("missing supported normalizer and pretokenizer combination")]
+    MissingNormalizerPretokenizer,
 }
 
 #[cfg(feature = "pyo3")]
